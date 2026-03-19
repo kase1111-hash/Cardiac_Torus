@@ -74,33 +74,32 @@ ECHONET_LVH_DIR = Path(r"G:\EchoNet-LVH")
 
 # ROI definitions for PLAX view (these are approximate)
 PLAX_ROIS = {
-    'mitral_valve': {  # Where MV leaflets are in PLAX
-        'y_start': 40, 'y_end': 75,
-        'x_start': 45, 'x_end': 80,
+    'mitral_valve': {  # MV leaflets in PLAX (center-lower)
+        'y_start': 300, 'y_end': 550,
+        'x_start': 350, 'x_end': 600,
     },
-    'aortic_root': {  # Aortic valve region
-        'y_start': 15, 'y_end': 45,
-        'x_start': 40, 'x_end': 75,
+    'aortic_root': {  # Aortic valve (upper-center)
+        'y_start': 100, 'y_end': 320,
+        'x_start': 350, 'x_end': 600,
     },
-    'lv_cavity': {  # LV cavity (filling/emptying)
-        'y_start': 50, 'y_end': 95,
-        'x_start': 30, 'x_end': 85,
+    'lv_cavity': {  # LV cavity bulk
+        'y_start': 280, 'y_end': 650,
+        'x_start': 250, 'x_end': 650,
     },
-    'septum': {  # IVS region  
-        'y_start': 25, 'y_end': 60,
-        'x_start': 20, 'x_end': 50,
+    'septum': {  # IVS region (upper-left to center)
+        'y_start': 200, 'y_end': 420,
+        'x_start': 180, 'x_end': 400,
     },
-    'posterior_wall': {  # LVPW region
-        'y_start': 75, 'y_end': 105,
-        'x_start': 30, 'x_end': 80,
+    'posterior_wall': {  # LVPW region (lower)
+        'y_start': 500, 'y_end': 700,
+        'x_start': 250, 'x_end': 600,
     },
 }
 
-# Virtual M-mode scanlines for PLAX
-# MV tips: vertical line through the center of the MV region
-MMODE_MV_X = 62   # Through mitral valve leaflet tips
-MMODE_AV_X = 56   # Through aortic valve
-MMODE_LV_X = 56   # Through LV at papillary muscle level
+# Virtual M-mode scanlines for 1024-wide PLAX
+MMODE_MV_X = 480   # Through mitral valve leaflet tips
+MMODE_AV_X = 450   # Through aortic valve
+MMODE_LV_X = 450   # Through LV
 
 MAX_VIDEOS = None
 SKIP_ERRORS = True
@@ -247,7 +246,7 @@ def process_plax_video(video_path):
 
         # Aortic valve scanline
         av_x = min(MMODE_AV_X, w-1)
-        scanline_av = gray[10:50, av_x].astype(float)  # Upper portion only
+        scanline_av = gray[80:320, av_x].astype(float)  # Upper portion for AV
         thresh_av = np.percentile(scanline_av, 80)
         bright_av = np.where(scanline_av >= thresh_av)[0]
         if len(bright_av) > 0:
@@ -283,6 +282,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_dir', type=str, default=str(ECHONET_LVH_DIR))
     parser.add_argument('--max_videos', type=int, default=MAX_VIDEOS)
+    parser.add_argument('--workers', type=int, default=1, help='Parallel workers (1-8)')
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
@@ -292,127 +292,186 @@ def main():
     print("Cardiac Torus Pipeline — Paper II")
     print("=" * 65)
 
-    # Find FileList
-    filelist_path = data_dir / "FileList.csv"
-    if not filelist_path.exists():
-        # Try subdirectories
+    # Find metadata CSV
+    filelist_path = None
+    for name in ['FileList.csv', 'MeasurementsList.csv', 'filelist.csv', 'measurements.csv']:
+        test = data_dir / name
+        if test.exists():
+            filelist_path = test; break
         for sub in ['', 'EchoNet-LVH']:
-            test = data_dir / sub / "FileList.csv"
-            if test.exists():
-                filelist_path = test
-                data_dir = test.parent
-                break
-        else:
-            print(f"ERROR: FileList.csv not found in {data_dir}")
-            sys.exit(1)
+            test2 = data_dir / sub / name
+            if test2.exists():
+                filelist_path = test2; data_dir = test2.parent; break
+        if filelist_path: break
 
-    df_meta = pd.read_csv(filelist_path)
-    print(f"\nLoaded metadata for {len(df_meta)} videos")
-    print(f"Columns: {list(df_meta.columns)}")
-
-    # Find key columns
-    fn_col = None
-    for c in ['FileName', 'filename', 'Video']:
-        if c in df_meta.columns:
-            fn_col = c; break
-
-    if fn_col is None:
-        print(f"ERROR: No filename column found")
+    if filelist_path is None:
+        # List what's actually there
+        print(f"ERROR: No metadata CSV found in {data_dir}")
+        print(f"Files found: {[f.name for f in data_dir.iterdir()]}")
         sys.exit(1)
 
-    # Find measurement columns (wall thickness, dimensions)
+    df_meta = pd.read_csv(filelist_path)
+    print(f"\nLoaded metadata from {filelist_path.name}: {len(df_meta)} rows")
+    print(f"Columns: {list(df_meta.columns)}")
+
+    # ---- Detect format: long (MeasurementsList) or wide (FileList) ----
+    is_long = 'Calc' in df_meta.columns and 'CalcValue' in df_meta.columns
+
+    if is_long:
+        print(f"  Long format detected — pivoting to wide...")
+        print(f"  Measurement types: {df_meta['Calc'].unique().tolist()}")
+
+        fn_col = 'HashedFileName'
+
+        # Pivot CalcValue to columns
+        df_wide = df_meta.pivot_table(
+            index=fn_col, columns='Calc', values='CalcValue', aggfunc='first'
+        ).reset_index()
+
+        # Get per-video metadata
+        vid_meta = df_meta.groupby(fn_col).first()[['Frames', 'FPS', 'Width', 'Height', 'split']].reset_index()
+        df_wide = df_wide.merge(vid_meta, on=fn_col, how='left')
+
+        # Grab LVIDd measurement coords for ROI guidance
+        lvid_rows = df_meta[df_meta['Calc'] == 'LVIDd'][[fn_col, 'Frame', 'X1', 'X2', 'Y1', 'Y2']].copy()
+        lvid_rows.columns = [fn_col, 'meas_frame', 'lvid_x1', 'lvid_x2', 'lvid_y1', 'lvid_y2']
+        df_wide = df_wide.merge(lvid_rows, on=fn_col, how='left')
+
+        # Derive FS and RWT
+        if 'LVIDd' in df_wide.columns and 'LVIDs' in df_wide.columns:
+            df_wide['FS'] = (df_wide['LVIDd'] - df_wide['LVIDs']) / df_wide['LVIDd']
+            print(f"  Derived: Fractional Shortening (FS)")
+        if 'LVPWd' in df_wide.columns and 'LVIDd' in df_wide.columns:
+            df_wide['RWT'] = 2 * df_wide['LVPWd'] / df_wide['LVIDd']
+            print(f"  Derived: Relative Wall Thickness (RWT)")
+
+        df_meta = df_wide
+        print(f"  Wide: {len(df_meta)} videos x {len(df_meta.columns)} columns")
+    else:
+        # Standard wide format — find filename column
+        fn_col = None
+        for c in df_meta.columns:
+            cl = c.lower().strip()
+            if cl in ['filename', 'video', 'hashedfilename']:
+                fn_col = c; break
+            if 'file' in cl and 'name' in cl:
+                fn_col = c; break
+        if fn_col is None:
+            fn_col = df_meta.columns[0]
+        print(f"  Filename column: '{fn_col}'")
+
+    # Map measurement columns
     measure_cols = {}
     for c in df_meta.columns:
-        cl = c.lower().strip()
-        if 'ivs' in cl or 'septum' in cl:
-            measure_cols['IVS'] = c
-        elif 'lvpw' in cl or 'posterior' in cl or 'pw' in cl:
-            measure_cols['LVPW'] = c
-        elif 'lvid' in cl and ('d' in cl or 'diast' in cl):
-            measure_cols['LVIDd'] = c
-        elif 'lvid' in cl and ('s' in cl or 'syst' in cl):
-            measure_cols['LVIDs'] = c
-        elif 'ef' in cl or 'ejection' in cl:
-            measure_cols['EF'] = c
-        elif 'fs' == cl or 'fractional' in cl:
-            measure_cols['FS'] = c
+        cl = c.strip()
+        if cl == 'IVSd': measure_cols['ivsd'] = c
+        elif cl == 'LVPWd': measure_cols['lvpwd'] = c
+        elif cl == 'LVIDd': measure_cols['lvidd'] = c
+        elif cl == 'LVIDs': measure_cols['lvids'] = c
+        elif cl == 'IVSs': measure_cols['ivss'] = c
+        elif cl == 'LVPWs': measure_cols['lvpws'] = c
+        elif cl == 'FS': measure_cols['fs'] = c
+        elif cl == 'RWT': measure_cols['rwt'] = c
+    print(f"  Measurements: {list(measure_cols.keys())}")
 
-    print(f"Measurement columns found: {measure_cols}")
+    # Find videos across Batch directories
+    video_dirs = []
+    for candidate in ['Videos', 'Batch1', 'Batch2', 'Batch3', 'Batch4',
+                       'Batch5', 'Batch6', 'Batch7', 'Batch8']:
+        d = data_dir / candidate
+        if d.exists() and d.is_dir():
+            video_dirs.append(d)
+    if not video_dirs:
+        video_dirs = [data_dir]
+    print(f"  Video dirs: {[d.name for d in video_dirs]}")
 
-    # Video directory
-    video_dir = data_dir / "Videos"
-    if not video_dir.exists():
-        for alt in ["videos", "a4c-video-dir", "plax-video-dir"]:
-            if (data_dir / alt).exists():
-                video_dir = data_dir / alt; break
-
-    print(f"Video directory: {video_dir}")
+    # Build filename→path lookup
+    video_lookup = {}
+    for vdir in video_dirs:
+        for f in vdir.iterdir():
+            if f.suffix.lower() == '.avi':
+                video_lookup[f.stem] = f
+                video_lookup[f.name] = f
+    print(f"  Videos on disk: {len(video_lookup)//2}")
 
     if args.max_videos:
         df_process = df_meta.head(args.max_videos)
     else:
         df_process = df_meta
 
-    print(f"\nProcessing {len(df_process)} videos...")
+    print(f"\nProcessing {len(df_process)} videos with {args.workers} worker(s)...")
 
-    # Process videos
-    all_results = []
-    errors = 0
+    # Build job list: (video_path, row_dict)
+    jobs = []
+    skipped = 0
+    for idx, row in df_process.iterrows():
+        filename = str(row[fn_col]).strip()
+        video_path = None
+        for variant in [filename, filename + '.avi', filename.replace('.avi', '') + '.avi']:
+            if variant in video_lookup:
+                video_path = video_lookup[variant]; break
+        if video_path is None:
+            stem = filename.replace('.avi', '')
+            if stem in video_lookup:
+                video_path = video_lookup[stem]
+        if video_path is None or not video_path.exists():
+            skipped += 1; continue
+        jobs.append((str(video_path), row.to_dict(), dict(measure_cols)))
 
-    for idx, row in tqdm(df_process.iterrows(), total=len(df_process), desc="PLAX"):
-        filename = row[fn_col]
-        if not filename.endswith('.avi'):
-            filename = filename + '.avi'
+    print(f"  Videos found: {len(jobs)}, skipped: {skipped}")
 
-        video_path = video_dir / filename
-        if not video_path.exists():
-            errors += 1
-            continue
-
+    def process_one(args_tuple):
+        vpath, row_dict, mcols = args_tuple
         try:
-            signals = process_plax_video(str(video_path))
+            signals = process_plax_video(vpath)
             if signals is None:
-                errors += 1
-                continue
-
+                return None
             result = {
-                'filename': row[fn_col],
+                'filename': row_dict[fn_col],
                 'n_frames': signals['n_frames'],
                 'fps': signals['fps'],
             }
-
-            # Add metadata measurements
-            for key, col in measure_cols.items():
-                if col in row.index and pd.notna(row[col]):
-                    result[key.lower()] = float(row[col])
-
-            # Compute torus features for each ROI signal
+            for key, col in mcols.items():
+                if col in row_dict and row_dict[col] is not None and pd.notna(row_dict[col]):
+                    result[key] = float(row_dict[col])
             for roi_name, signal in signals['roi_signals'].items():
                 feats = compute_signal_torus(signal, roi_name)
-                if feats:
-                    result.update(feats)
-
-            # Virtual M-mode signals
+                if feats: result.update(feats)
             mv_feats = compute_signal_torus(signals['mmode_mv'], 'mmode_mv')
-            if mv_feats:
-                result.update(mv_feats)
-
+            if mv_feats: result.update(mv_feats)
             av_feats = compute_signal_torus(signals['mmode_av'], 'mmode_av')
-            if av_feats:
-                result.update(av_feats)
-
-            # Motion energy
+            if av_feats: result.update(av_feats)
             if len(signals['frame_diffs']) > 20:
                 motion_feats = compute_signal_torus(signals['frame_diffs'], 'motion')
-                if motion_feats:
-                    result.update(motion_feats)
-
-            all_results.append(result)
-
+                if motion_feats: result.update(motion_feats)
+            return result
         except Exception as e:
-            if not SKIP_ERRORS:
-                raise
-            errors += 1
+            return None
+
+    all_results = []
+    errors = 0
+
+    if args.workers <= 1:
+        for i, job in enumerate(tqdm(jobs, desc="PLAX")):
+            r = process_one(job)
+            if r: all_results.append(r)
+            else: errors += 1
+            # Checkpoint save every 2000 videos
+            if (i+1) % 2000 == 0:
+                pd.DataFrame(all_results).to_csv(RESULTS_DIR / 'echonet_lvh_torus_results_checkpoint.csv', index=False)
+                print(f"\n  Checkpoint saved: {len(all_results)} results at video {i+1}")
+    else:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            futures = {executor.submit(process_one, j): j for j in jobs}
+            for i, future in enumerate(as_completed(futures)):
+                r = future.result()
+                if r: all_results.append(r)
+                else: errors += 1
+                if (i+1) % 500 == 0 or i+1 == len(jobs):
+                    print(f"  Progress: {i+1}/{len(jobs)} ({len(all_results)} ok, {errors} err)")
+                if (i+1) % 2000 == 0:
+                    pd.DataFrame(all_results).to_csv(RESULTS_DIR / 'echonet_lvh_torus_results_checkpoint.csv', index=False)
 
     print(f"\nProcessed: {len(all_results)}, Errors: {errors}")
 
@@ -435,7 +494,7 @@ def main():
                         'posterior_wall', 'mmode_mv', 'mmode_av', 'motion']
 
     targets = []
-    for key in ['ef', 'ivs', 'lvpw', 'lvidd', 'lvids', 'fs']:
+    for key in ['lvidd', 'lvids', 'ivsd', 'lvpwd', 'fs', 'rwt', 'ivss', 'lvpws', 'ef']:
         if key in df.columns and df[key].notna().sum() > 20:
             targets.append(key)
 
