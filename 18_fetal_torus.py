@@ -121,69 +121,41 @@ def compute_torus_features(values, label=""):
 
 def read_ctg_record(dat_path):
     """
-    Read a CTU-UHB CTG record.
-    .dat files: 2 channels, 16-bit integers, 4 Hz
-    Channel 1: FHR (bpm), Channel 2: UC
-    Values of 0 indicate missing/invalid data.
+    Read a CTU-UHB CTG record using wfdb library.
+    Returns FHR array (bpm) and clinical metadata dict.
     """
-    hea_path = dat_path.with_suffix('.hea')
-    if not hea_path.exists():
+    try:
+        import wfdb
+    except ImportError:
+        print("ERROR: wfdb not installed. Run: pip install wfdb")
         return None, {}
 
-    # Parse header for metadata
-    metadata = {}
-    n_samples = 0
-    n_channels = 2
-    fs = 4  # default
-
-    with open(hea_path, 'r') as f:
-        lines = f.readlines()
-
-    # First line: record info
-    parts = lines[0].strip().split()
-    if len(parts) >= 4:
-        n_channels = int(parts[1])
-        fs = int(parts[2])
-        n_samples = int(parts[3])
-
-    # Comment lines contain clinical data
-    for line in lines:
-        line = line.strip()
-        if line.startswith('#'):
-            # Parse key-value pairs from comments
-            content = line[1:].strip()
-            if ':' in content:
-                key, val = content.split(':', 1)
-                metadata[key.strip()] = val.strip()
-            elif ' ' in content:
-                # Some fields are space-separated
-                parts = content.split()
-                if len(parts) == 2:
-                    metadata[parts[0]] = parts[1]
-
-    # Read binary data
+    record_path = str(dat_path.with_suffix(''))
     try:
-        with open(dat_path, 'rb') as f:
-            raw = f.read()
-
-        # 16-bit signed integers, 2 channels interleaved
-        n_total = len(raw) // 2  # number of 16-bit samples
-        data = np.frombuffer(raw, dtype=np.int16)
-
-        if n_channels == 2:
-            fhr = data[0::2].astype(float)  # Channel 1: FHR
-            uc = data[1::2].astype(float)   # Channel 2: UC
-        else:
-            fhr = data.astype(float)
-            uc = np.zeros_like(fhr)
-
-        # Replace 0 with NaN (0 = missing/invalid in this dataset)
-        fhr[fhr == 0] = np.nan
-
-        return fhr, metadata
-
+        rec = wfdb.rdrecord(record_path)
     except Exception as e:
-        return None, metadata
+        return None, {}
+
+    # Channel 0 = FHR (bpm), Channel 1 = UC
+    fhr = rec.p_signal[:, 0].copy()
+
+    # Parse clinical metadata from comments
+    metadata = {}
+    for comment in rec.comments:
+        comment = comment.strip()
+        if comment.startswith('--') or comment.startswith('-----'):
+            continue
+        # Format: "pH           7.14" — key then whitespace then value
+        parts = comment.split()
+        if len(parts) >= 2:
+            key = parts[0]
+            val = parts[-1]  # take last token as value
+            metadata[key] = val
+
+    # Mark invalid values (0 or very low) as NaN
+    fhr[fhr < 50] = np.nan
+
+    return fhr, metadata
 
 
 def extract_fhr_intervals(fhr, fs=4):
@@ -248,41 +220,53 @@ def parse_clinical_metadata(metadata):
     clinical = {}
 
     # pH is the primary outcome
-    for key in ['pH', 'ph', 'PH']:
-        if key in metadata:
-            try:
-                clinical['pH'] = float(metadata[key])
-            except:
-                pass
+    if 'pH' in metadata:
+        try:
+            clinical['pH'] = float(metadata['pH'])
+        except: pass
 
     # Apgar scores
-    for key in ['Apgar1', 'apgar1', 'APGAR1']:
-        if key in metadata:
-            try:
-                clinical['Apgar1'] = int(metadata[key])
-            except:
-                pass
-
-    for key in ['Apgar5', 'apgar5', 'APGAR5']:
-        if key in metadata:
-            try:
-                clinical['Apgar5'] = int(metadata[key])
-            except:
-                pass
+    if 'Apgar1' in metadata:
+        try: clinical['Apgar1'] = int(metadata['Apgar1'])
+        except: pass
+    if 'Apgar5' in metadata:
+        try: clinical['Apgar5'] = int(metadata['Apgar5'])
+        except: pass
 
     # Other outcomes
-    for key in ['BDecf', 'pCO2', 'BE', 'Gravidity', 'Parity',
-                'Weight', 'Sex', 'Age', 'Gest.weeks']:
+    for key in ['BDecf', 'pCO2', 'BE']:
         if key in metadata:
-            try:
-                clinical[key] = float(metadata[key])
-            except:
-                clinical[key] = metadata[key]
+            try: clinical[key] = float(metadata[key])
+            except: pass
 
-    # Delivery type
-    for key in ['Delivery', 'delivery']:
-        if key in metadata:
-            clinical['Delivery'] = metadata[key]
+    # Fetal descriptors
+    if 'Gest.' in metadata:
+        try: clinical['gest_weeks'] = int(metadata['Gest.'])
+        except: pass
+    # Try alternate key format
+    for k, v in metadata.items():
+        if 'gest' in k.lower() and 'week' in k.lower():
+            try: clinical['gest_weeks'] = int(v)
+            except: pass
+
+    if 'Weight(g)' in metadata:
+        try: clinical['weight_g'] = int(metadata['Weight(g)'])
+        except: pass
+    elif 'Weight' in metadata:
+        try: clinical['weight_g'] = int(metadata['Weight'])
+        except: pass
+
+    if 'Sex' in metadata:
+        clinical['sex'] = metadata['Sex']
+
+    if 'Age' in metadata:
+        try: clinical['maternal_age'] = int(metadata['Age'])
+        except: pass
+
+    # Delivery type (1=spontaneous, 2=forceps, 3=vacuum, 4=CS)
+    if 'Deliv.' in metadata:
+        try: clinical['delivery_type'] = int(metadata['Deliv.'])
+        except: clinical['delivery_type'] = metadata['Deliv.']
 
     return clinical
 
